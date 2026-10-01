@@ -179,7 +179,7 @@ def generate_profile(apps, now=None):
     return f'''abi <abi/4.0>,
 include <tunables/global>
 
-profile applock-session /usr/bin/gnome-shell flags=(attach_disconnected mediate_deleted) {{
+profile applock-session /** flags=(attach_disconnected mediate_deleted) {{
   allow all,
 
   # Apps currently locked by schedule

@@ -221,6 +221,35 @@ def install_desktop_override(name, path):
     return info.get_id()
 
 
+def remove_stale_desktop_overrides(apps):
+    """Remove App Lock desktop overrides for apps no longer configured."""
+    if not DESKTOP_OVERRIDE_DIR.exists():
+        return
+    desktop_ids = {
+        info["desktop_id"] for info in apps.values() if info.get("desktop_id")
+    }
+    for path in DESKTOP_OVERRIDE_DIR.glob("*.desktop"):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        if "X-AppLock=1" not in text or path.name in desktop_ids:
+            continue
+        path.unlink()
+    update_desktop_database()
+
+
+def restore_desktop_override(desktop_id, path):
+    """Keep a launcher visible while removing App Lock behavior from it."""
+    if not desktop_id:
+        return
+    target = DESKTOP_OVERRIDE_DIR / desktop_id
+    if not target.exists():
+        return
+    target.write_text(f"Exec={path}", encoding="utf-8")
+    update_desktop_database()
+
+
 def remove_desktop_override(desktop_id):
     if not desktop_id:
         return
@@ -352,6 +381,7 @@ def apply_config(config_path):
     apps = {name: normalize_app(name, info) for name, info in raw_apps.items()}
     websites = normalize_websites(raw_websites)
     save_config(apps, websites)
+    remove_stale_desktop_overrides(apps)
     common.sync_profile(apps)
     common.sync_website_blocks(websites)
     signal_daemon()
@@ -378,7 +408,11 @@ def remove_app(name):
     if name not in apps:
         raise SystemExit(f"Unknown app: {name}")
     info = apps.pop(name)
-    remove_desktop_override(info.get("desktop_id"))
+    desktop_id = info.get("desktop_id")
+    if desktop_id:
+        restore_desktop_override(desktop_id, info.get("path", ""))
+    elif info.get("path"):
+        pass  # Apps without a desktop entry are CLI-only and do not affect the app menu.
     save_apps(apps)
     common.sync_profile(apps)
     signal_daemon()
@@ -475,6 +509,7 @@ def sync():
     }
     websites = normalize_websites(config.get("websites", {}))
     save_config(apps, websites)
+    remove_stale_desktop_overrides(apps)
     common.sync_profile(apps)
     common.sync_website_blocks(websites)
     signal_daemon()
