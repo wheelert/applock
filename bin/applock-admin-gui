@@ -1,0 +1,1124 @@
+#!/usr/bin/python3
+import json
+import os
+import subprocess
+import sys
+import shutil
+import tempfile
+import threading
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gio, Gdk, GLib, GObject, Gtk, Pango
+
+sys.path.insert(0, os.environ.get("APPLOCK_LIB", "/usr/local/lib/applock"))
+try:
+    import applock_common as common
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+    import applock_common as common
+
+CONFIG_PATH = Path("/etc/applock/apps.json")
+ADMIN_TOOL = "/usr/local/bin/applock-admin"
+POLL_SECONDS = 30
+
+
+class AppLockAdmin(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.thomas.AppLockConfig")
+        self.window = None
+        self.interface_settings = Gio.Settings.new("org.gnome.desktop.interface")
+        self.interface_settings.connect(
+            "changed::color-scheme",
+            self.on_color_scheme_changed,
+        )
+
+    def apply_color_scheme(self):
+        display = Gdk.Display.get_default()
+        if display is None:
+            return
+        gtk_settings = Gtk.Settings.get_for_display(display)
+        scheme = self.interface_settings.get_string("color-scheme")
+        prefer_dark = scheme in ("prefer-dark", "dark")
+        gtk_settings.set_property(
+            "gtk-application-prefer-dark-theme",
+            prefer_dark,
+        )
+
+    def on_color_scheme_changed(self, _settings, _key):
+        self.apply_color_scheme()
+
+    def do_activate(self):
+        if self.window is None:
+            self.window = AppLockWindow(application=self)
+        self.window.present()
+        self.apply_color_scheme()
+
+
+class TimePicker(Gtk.Box):
+    __gsignals__ = {
+        "changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+
+    def __init__(self, **kwargs):
+        super().__init__(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=4,
+            halign=Gtk.Align.START,
+            valign=Gtk.Align.CENTER,
+            **kwargs,
+        )
+
+        self._updating = False
+        self.hour_spin = Gtk.SpinButton.new_with_range(0, 23, 1)
+        self.minute_spin = Gtk.SpinButton.new_with_range(0, 59, 1)
+
+        for button in (self.hour_spin, self.minute_spin):
+            button.set_numeric(True)
+            button.set_wrap(True)
+            button.set_snap_to_ticks(True)
+            button.set_width_chars(2)
+            button.set_max_width_chars(2)
+            button.set_hexpand(False)
+            button.set_valign(Gtk.Align.CENTER)
+            button.connect("value-changed", self._on_value_changed)
+
+        separator = Gtk.Label(label=":")
+        separator.set_valign(Gtk.Align.CENTER)
+
+        self.append(self.hour_spin)
+        self.append(separator)
+        self.append(self.minute_spin)
+
+        self.hour_spin.set_increments(1, 6)
+        self.minute_spin.set_increments(1, 10)
+
+    def _on_value_changed(self, _button):
+        if self._updating:
+            return
+        self.emit("changed")
+
+    def get_text(self):
+        return f"{int(self.hour_spin.get_value()):02d}:{int(self.minute_spin.get_value()):02d}"
+
+    def set_text(self, text):
+        value = common.parse_time(text)
+        hour, minute = divmod(value, 60) if value is not None else (0, 0)
+
+        self._updating = True
+        try:
+            self.hour_spin.set_value(hour)
+            self.minute_spin.set_value(minute)
+        finally:
+            self._updating = False
+
+
+class AppLockWindow(Gtk.ApplicationWindow):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.set_title("AppLockConfig")
+        self.set_default_size(760, 560)
+        self.apps = {}
+        self.websites = {}
+        self.selected_name = None
+        self.selected_website = None
+        self.applying = False
+        self.source_id = None
+
+        header = Gtk.HeaderBar()
+        self.set_titlebar(header)
+
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        title = Gtk.Label(label="AppLockConfig")
+        title.add_css_class("title-3")
+        subtitle = Gtk.Label(label="AppArmor app locks and scheduled website blocks")
+        subtitle.add_css_class("dim-label")
+        title_box.append(title)
+        title_box.append(subtitle)
+        header.set_title_widget(title_box)
+
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        main.set_margin_top(18)
+        main.set_margin_bottom(18)
+        main.set_margin_start(18)
+        main.set_margin_end(18)
+        self.set_child(main)
+
+        notebook = Gtk.Notebook()
+        notebook.set_vexpand(True)
+        main.append(notebook)
+
+        apps_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        notebook.append_page(apps_page, Gtk.Label(label="Applications"))
+
+        app_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        apps_page.append(app_box)
+
+        self.app_list = Gtk.StringList()
+        self.app_combo = Gtk.DropDown.new(self.app_list)
+        self.app_combo.set_hexpand(True)
+        self.app_combo.set_enable_search(False)
+        self.app_combo.connect("notify::selected", self.on_app_changed)
+        app_box.append(self.app_combo)
+
+        add_button = Gtk.Button(label="Add…")
+        add_button.connect("clicked", self.on_add_clicked)
+        app_box.append(add_button)
+
+        browse_button = Gtk.Button(label="Browse…")
+        browse_button.set_tooltip_text("Choose an installed application from the desktop app menu")
+        browse_button.connect("clicked", self.on_browse_apps_clicked)
+        app_box.append(browse_button)
+
+        remove_button = Gtk.Button(label="Remove")
+        remove_button.add_css_class("destructive-action")
+        remove_button.connect("clicked", self.on_remove_clicked)
+        app_box.append(remove_button)
+
+        details = Gtk.Frame()
+        details.set_vexpand(True)
+        apps_page.append(details)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(14)
+        grid.set_column_spacing(14)
+        grid.set_margin_top(14)
+        grid.set_margin_bottom(14)
+        grid.set_margin_start(14)
+        grid.set_margin_end(14)
+        details.set_child(grid)
+
+        row = 0
+
+        name_label = Gtk.Label(label="Application", halign=Gtk.Align.START)
+        name_label.add_css_class("heading")
+        grid.attach(name_label, 0, row, 1, 1)
+        self.name_value = Gtk.Label(halign=Gtk.Align.START, selectable=True)
+        grid.attach(self.name_value, 1, row, 1, 1)
+        row += 1
+
+        path_label = Gtk.Label(label="Executable", halign=Gtk.Align.START)
+        path_label.add_css_class("heading")
+        grid.attach(path_label, 0, row, 1, 1)
+        self.path_value = Gtk.Label(halign=Gtk.Align.START, selectable=True, wrap=True)
+        grid.attach(self.path_value, 1, row, 1, 1)
+        row += 1
+
+        always_label = Gtk.Label(label="Always locked", halign=Gtk.Align.START)
+        always_label.add_css_class("heading")
+        grid.attach(always_label, 0, row, 1, 1)
+        self.always_switch = Gtk.Switch(halign=Gtk.Align.START)
+        self.always_switch.connect("notify::active", self.on_always_changed)
+        grid.attach(self.always_switch, 1, row, 1, 1)
+        row += 1
+
+        start_label = Gtk.Label(label="Locked from", halign=Gtk.Align.START)
+        start_label.add_css_class("heading")
+        grid.attach(start_label, 0, row, 1, 1)
+        self.start_entry = TimePicker()
+        self.start_entry.set_tooltip_text("Lock begins at this 24-hour time")
+        self.start_entry.connect("changed", self.on_schedule_changed)
+        grid.attach(self.start_entry, 1, row, 1, 1)
+        row += 1
+
+        end_label = Gtk.Label(label="Locked until", halign=Gtk.Align.START)
+        end_label.add_css_class("heading")
+        grid.attach(end_label, 0, row, 1, 1)
+        self.end_entry = TimePicker()
+        self.end_entry.set_tooltip_text("Lock ends at this 24-hour time")
+        self.end_entry.connect("changed", self.on_schedule_changed)
+        grid.attach(self.end_entry, 1, row, 1, 1)
+        row += 1
+
+        status_label = Gtk.Label(label="Current status", halign=Gtk.Align.START)
+        status_label.add_css_class("heading")
+        grid.attach(status_label, 0, row, 1, 1)
+        self.status_value = Gtk.Label(halign=Gtk.Align.START)
+        grid.attach(self.status_value, 1, row, 1, 1)
+
+        websites_page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        notebook.append_page(websites_page, Gtk.Label(label="Websites"))
+
+        website_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        websites_page.append(website_box)
+
+        self.website_list = Gtk.StringList()
+        self.website_combo = Gtk.DropDown.new(self.website_list)
+        self.website_combo.set_hexpand(True)
+        self.website_combo.set_enable_search(False)
+        self.website_combo.connect("notify::selected", self.on_website_changed)
+        website_box.append(self.website_combo)
+
+        self.website_add_entry = Gtk.Entry()
+        self.website_add_entry.set_placeholder_text("example.com")
+        self.website_add_entry.set_width_chars(24)
+        self.website_add_entry.connect("activate", self.on_add_website_clicked)
+        website_box.append(self.website_add_entry)
+
+        website_add_button = Gtk.Button(label="Add")
+        website_add_button.add_css_class("suggested-action")
+        website_add_button.connect("clicked", self.on_add_website_clicked)
+        website_box.append(website_add_button)
+
+        website_remove_button = Gtk.Button(label="Remove")
+        website_remove_button.add_css_class("destructive-action")
+        website_remove_button.connect("clicked", self.on_remove_website_clicked)
+        website_box.append(website_remove_button)
+
+        website_details = Gtk.Frame()
+        website_details.set_vexpand(True)
+        websites_page.append(website_details)
+
+        website_grid = Gtk.Grid()
+        website_grid.set_row_spacing(14)
+        website_grid.set_column_spacing(14)
+        website_grid.set_margin_top(14)
+        website_grid.set_margin_bottom(14)
+        website_grid.set_margin_start(14)
+        website_grid.set_margin_end(14)
+        website_details.set_child(website_grid)
+
+        website_row = 0
+
+        website_name_label = Gtk.Label(label="Website", halign=Gtk.Align.START)
+        website_name_label.add_css_class("heading")
+        website_grid.attach(website_name_label, 0, website_row, 1, 1)
+        self.website_name_value = Gtk.Label(halign=Gtk.Align.START, selectable=True)
+        website_grid.attach(self.website_name_value, 1, website_row, 1, 1)
+        website_row += 1
+
+        hosts_label = Gtk.Label(label="Blocked hosts", halign=Gtk.Align.START)
+        hosts_label.add_css_class("heading")
+        website_grid.attach(hosts_label, 0, website_row, 1, 1)
+        self.website_hosts_value = Gtk.Label(
+            halign=Gtk.Align.START, selectable=True, wrap=True
+        )
+        website_grid.attach(self.website_hosts_value, 1, website_row, 1, 1)
+        website_row += 1
+
+        website_always_label = Gtk.Label(label="Always blocked", halign=Gtk.Align.START)
+        website_always_label.add_css_class("heading")
+        website_grid.attach(website_always_label, 0, website_row, 1, 1)
+        self.website_always_switch = Gtk.Switch(halign=Gtk.Align.START)
+        self.website_always_switch.connect(
+            "notify::active", self.on_website_always_changed
+        )
+        website_grid.attach(self.website_always_switch, 1, website_row, 1, 1)
+        website_row += 1
+
+        website_start_label = Gtk.Label(label="Blocked from", halign=Gtk.Align.START)
+        website_start_label.add_css_class("heading")
+        website_grid.attach(website_start_label, 0, website_row, 1, 1)
+        self.website_start_entry = TimePicker()
+        self.website_start_entry.set_tooltip_text("Blocking begins at this 24-hour time")
+        self.website_start_entry.connect("changed", self.on_website_schedule_changed)
+        website_grid.attach(self.website_start_entry, 1, website_row, 1, 1)
+        website_row += 1
+
+        website_end_label = Gtk.Label(label="Blocked until", halign=Gtk.Align.START)
+        website_end_label.add_css_class("heading")
+        website_grid.attach(website_end_label, 0, website_row, 1, 1)
+        self.website_end_entry = TimePicker()
+        self.website_end_entry.set_tooltip_text("Blocking ends at this 24-hour time")
+        self.website_end_entry.connect("changed", self.on_website_schedule_changed)
+        website_grid.attach(self.website_end_entry, 1, website_row, 1, 1)
+        website_row += 1
+
+        website_status_label = Gtk.Label(label="Current status", halign=Gtk.Align.START)
+        website_status_label.add_css_class("heading")
+        website_grid.attach(website_status_label, 0, website_row, 1, 1)
+        self.website_status_value = Gtk.Label(halign=Gtk.Align.START)
+        website_grid.attach(self.website_status_value, 1, website_row, 1, 1)
+
+        website_note = Gtk.Label(
+            label=(
+                "Website blocking is DNS-level and applies to the listed hostnames. "
+                "It can be bypassed by VPNs, DNS-over-HTTPS, proxies, or direct IP addresses."
+            ),
+            halign=Gtk.Align.START,
+            wrap=True,
+            xalign=0,
+        )
+        website_note.add_css_class("dim-label")
+        websites_page.append(website_note)
+
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        main.append(button_box)
+
+        self.code_button = Gtk.Button(label="Set unlock code…")
+        self.code_button.connect("clicked", self.on_set_code_clicked)
+        button_box.append(self.code_button)
+
+        reload_button = Gtk.Button(label="Reload")
+        reload_button.connect("clicked", lambda *_: self.load_config())
+        button_box.append(reload_button)
+
+        self.sync_button = Gtk.Button(label="Sync rules")
+        self.sync_button.connect("clicked", self.on_sync_clicked)
+        button_box.append(self.sync_button)
+
+        self.apply_button = Gtk.Button(label="Apply")
+        self.apply_button.add_css_class("suggested-action")
+        self.apply_button.connect("clicked", self.on_apply_clicked)
+        button_box.append(self.apply_button)
+
+        self.status_label = Gtk.Label(halign=Gtk.Align.START)
+        self.status_label.add_css_class("dim-label")
+        main.append(self.status_label)
+
+        self.source_id = GLib.timeout_add_seconds(30, self.on_status_tick)
+        self.load_config()
+
+    def set_status(self, message, error=False):
+        self.status_label.set_text(message)
+        if error:
+            self.status_label.remove_css_class("dim-label")
+            self.status_label.add_css_class("error")
+        else:
+            self.status_label.remove_css_class("error")
+            self.status_label.add_css_class("dim-label")
+
+    def load_config(self):
+        try:
+            config = common.load_config(CONFIG_PATH)
+            self.apps = config.get("apps", {})
+            self.websites = config.get("websites", {})
+        except Exception as exc:
+            self.apps = {}
+            self.websites = {}
+            self.set_status(f"Unable to load configuration: {exc}", error=True)
+            self.refresh_combo()
+            self.refresh_website_combo()
+            return
+
+        self.set_status("Configuration loaded")
+        self.refresh_combo()
+        self.refresh_website_combo()
+
+    def refresh_combo(self):
+        selected = self.selected_name
+        self.app_list.splice(0, self.app_list.get_n_items(), [])
+        for name in sorted(self.apps):
+            self.app_list.append(name)
+
+        if selected in self.apps:
+            self.select_app(selected)
+        elif self.apps:
+            self.select_app(sorted(self.apps)[0])
+        else:
+            self.selected_name = None
+            self.app_combo.set_selected(Gtk.INVALID_LIST_POSITION)
+            self.populate_details()
+
+    def select_app(self, name):
+        self.selected_name = name
+        index = Gtk.INVALID_LIST_POSITION if name is None else sorted(self.apps).index(name)
+        self.app_combo.set_selected(index)
+        self.populate_details()
+
+    def refresh_website_combo(self):
+        selected = self.selected_website
+        self.website_list.splice(
+            0, self.website_list.get_n_items(), []
+        )
+        for name in sorted(self.websites):
+            self.website_list.append(name)
+
+        if selected in self.websites:
+            self.select_website(selected)
+        elif self.websites:
+            self.select_website(sorted(self.websites)[0])
+        else:
+            self.selected_website = None
+            self.website_combo.set_selected(Gtk.INVALID_LIST_POSITION)
+            self.populate_website_details()
+
+    def select_website(self, name):
+        self.selected_website = name
+        index = (
+            Gtk.INVALID_LIST_POSITION
+            if name is None
+            else sorted(self.websites).index(name)
+        )
+        self.website_combo.set_selected(index)
+        self.populate_website_details()
+
+    def on_website_changed(self, combo, _param):
+        selected = combo.get_selected()
+        if selected == Gtk.INVALID_LIST_POSITION:
+            name = None
+        else:
+            name = self.website_list.get_string(selected)
+        self.selected_website = name
+        self.populate_website_details()
+
+    def populate_website_details(self):
+        website = self.websites.get(self.selected_website)
+        enabled = website is not None
+
+        for widget in (
+            self.website_name_value,
+            self.website_hosts_value,
+            self.website_always_switch,
+            self.website_start_entry,
+            self.website_end_entry,
+            self.website_status_value,
+        ):
+            widget.set_sensitive(enabled)
+
+        if website is None:
+            self.website_name_value.set_text("No blocked websites")
+            self.website_hosts_value.set_text("")
+            self.website_always_switch.set_active(True)
+            self.website_start_entry.set_text("")
+            self.website_end_entry.set_text("")
+            self.website_status_value.set_text("")
+            return
+
+        schedule = website.get("schedule", {"always": True})
+        always = bool(schedule.get("always", True))
+        self.website_name_value.set_text(self.selected_website)
+        self.website_hosts_value.set_text(
+            ", ".join(website.get("domains", [self.selected_website]))
+        )
+        self.website_always_switch.set_active(always)
+        self.website_start_entry.set_text(schedule.get("start", ""))
+        self.website_end_entry.set_text(schedule.get("end", ""))
+        self.update_website_status()
+
+    def update_website_status(self):
+        website = self.websites.get(self.selected_website)
+        if website is None:
+            return
+        blocked = common.schedule_is_locked(website.get("schedule"))
+        self.website_status_value.set_text(
+            "Blocked now" if blocked else "Allowed now"
+        )
+        if blocked:
+            self.website_status_value.add_css_class("error")
+        else:
+            self.website_status_value.remove_css_class("error")
+
+    def on_website_always_changed(self, switch, _param):
+        always = switch.get_active()
+        self.website_start_entry.set_sensitive(not always)
+        self.website_end_entry.set_sensitive(not always)
+        website = self.websites.get(self.selected_website)
+        if website is not None:
+            schedule = website.setdefault("schedule", {})
+            schedule["always"] = always
+        self.update_website_status()
+
+    def on_website_schedule_changed(self, _entry):
+        website = self.websites.get(self.selected_website)
+        if website is None:
+            return
+        schedule = website.setdefault("schedule", {"always": False})
+        schedule["always"] = False
+        schedule["start"] = self.website_start_entry.get_text().strip()
+        schedule["end"] = self.website_end_entry.get_text().strip()
+        self.update_website_status()
+
+    def on_add_website_clicked(self, _button):
+        value = self.website_add_entry.get_text().strip()
+        if not value:
+            self.set_status("Enter a website domain or URL", error=True)
+            return
+
+        try:
+            name, domains = common.parse_website(value)
+        except ValueError as exc:
+            self.set_status(str(exc), error=True)
+            return
+
+        if name in self.websites:
+            self.set_status(f"{name} is already configured", error=True)
+            return
+
+        self.websites[name] = {
+            "domain": name,
+            "domains": domains,
+            "schedule": {"always": True},
+        }
+        self.website_add_entry.set_text("")
+        self.refresh_website_combo()
+        self.select_website(name)
+        self.set_status(f"Added {name}. Choose a schedule, then apply.")
+
+    def on_remove_website_clicked(self, _button):
+        if self.selected_website is None:
+            return
+
+        name = self.selected_website
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"Stop blocking {name}?",
+        )
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("_Remove", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.connect("response", self.on_remove_website_response, name)
+        dialog.present()
+
+    def on_remove_website_response(self, dialog, response, name):
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or name not in self.websites:
+            return
+        del self.websites[name]
+        self.refresh_website_combo()
+        self.set_status(f"Removed {name}. Apply to save the change.")
+
+    def on_app_changed(self, combo, _param):
+        selected = combo.get_selected()
+        if selected == Gtk.INVALID_LIST_POSITION:
+            name = None
+        else:
+            name = self.app_list.get_string(selected)
+        self.selected_name = name
+        self.populate_details()
+
+    def populate_details(self):
+        app = self.apps.get(self.selected_name)
+        enabled = app is not None
+
+        for widget in (
+            self.name_value,
+            self.path_value,
+            self.always_switch,
+            self.start_entry,
+            self.end_entry,
+            self.status_value,
+        ):
+            widget.set_sensitive(enabled)
+
+        if app is None:
+            self.name_value.set_text("No locked apps")
+            self.path_value.set_text("")
+            self.always_switch.set_active(True)
+            self.start_entry.set_text("")
+            self.end_entry.set_text("")
+            self.status_value.set_text("")
+            return
+
+        schedule = app.get("schedule", {"always": True})
+        always = bool(schedule.get("always", True))
+        self.name_value.set_text(self.selected_name)
+        self.path_value.set_text(app.get("path", ""))
+        self.always_switch.set_active(always)
+        self.start_entry.set_text(schedule.get("start", ""))
+        self.end_entry.set_text(schedule.get("end", ""))
+        self.update_current_status()
+
+    def on_status_tick(self):
+        self.update_current_status()
+        self.update_website_status()
+        return GLib.SOURCE_CONTINUE
+
+    def update_current_status(self):
+        app = self.apps.get(self.selected_name)
+        if app is None:
+            return
+        locked = common.schedule_is_locked(app.get("schedule"))
+        self.status_value.set_text("Locked now" if locked else "Unlocked now")
+        if locked:
+            self.status_value.add_css_class("error")
+        else:
+            self.status_value.remove_css_class("error")
+
+    def on_always_changed(self, switch, _param):
+        always = switch.get_active()
+        self.start_entry.set_sensitive(not always)
+        self.end_entry.set_sensitive(not always)
+        app = self.apps.get(self.selected_name)
+        if app is not None:
+            app.setdefault("schedule", {})
+            app["schedule"]["always"] = always
+        self.update_current_status()
+
+    def on_schedule_changed(self, _entry):
+        app = self.apps.get(self.selected_name)
+        if app is None:
+            return
+        schedule = app.setdefault("schedule", {"always": False})
+        schedule["always"] = False
+        schedule["start"] = self.start_entry.get_text().strip()
+        schedule["end"] = self.end_entry.get_text().strip()
+        self.update_current_status()
+
+    def on_add_clicked(self, _button):
+        chooser = Gtk.FileChooserNative.new(
+            "Choose an application",
+            self,
+            Gtk.FileChooserAction.OPEN,
+            "_Add",
+            "_Cancel",
+        )
+        chooser.set_modal(True)
+
+        executable_filter = Gtk.FileFilter()
+        executable_filter.set_name("Executable files")
+        executable_filter.add_mime_type("application/x-executable")
+        executable_filter.add_mime_type("application/x-sharedlib")
+        executable_filter.add_pattern("*.sh")
+        chooser.add_filter(executable_filter)
+
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("All files")
+        all_filter.add_pattern("*")
+        chooser.add_filter(all_filter)
+
+        chooser.connect("response", self.on_add_response)
+        chooser.show()
+
+    def on_add_response(self, chooser, response):
+        if response != Gtk.ResponseType.ACCEPT:
+            chooser.destroy()
+            return
+
+        file = chooser.get_file()
+        chooser.destroy()
+        if file is None:
+            return
+
+        path = file.get_path()
+        if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+            self.set_status("Choose an executable application file", error=True)
+            return
+
+        name = Path(path).stem
+        if name in self.apps:
+            self.set_status(f"An app named {name} is already configured", error=True)
+            return
+
+        self.apps[name] = {
+            "path": path,
+            "argv": [path],
+            "schedule": {"always": True},
+        }
+        self.refresh_combo()
+        self.select_app(name)
+        self.set_status(f"Added {name}. Choose a schedule, then apply.")
+
+    def get_desktop_apps(self):
+        apps_by_id = {}
+
+        for info in Gio.DesktopAppInfo.get_all():
+            if not info.should_show():
+                continue
+
+            if info.get_executable() == "/usr/local/bin/applock-launch" or (
+                info.get_commandline() or "").startswith("/usr/local/bin/applock-launch"):
+                info = self.load_original_desktop_info(info)
+                if info is None:
+                    continue
+
+            app_id = info.get_id()
+            if not app_id:
+                continue
+            apps_by_id[app_id] = info
+
+        return sorted(apps_by_id.values(), key=lambda info: (info.get_name() or "").casefold())
+
+    def load_original_desktop_info(self, override_info):
+        app_id = override_info.get_id()
+        search_paths = [
+            Path("/usr/share/applications"),
+            Path.home() / ".local/share/applications",
+            Path("/var/lib/flatpak/exports/share/applications"),
+            Path("/usr/local/share/applications"),
+        ]
+
+        for directory in search_paths:
+            path = directory / app_id
+            if not path.is_file():
+                continue
+
+            try:
+                info = Gio.DesktopAppInfo.new_from_filename(str(path))
+            except Exception:
+                continue
+
+            if info and info.get_executable() != "/usr/local/bin/applock-launch":
+                return info
+
+        return None
+
+    def on_browse_apps_clicked(self, _button):
+        dialog = Gtk.Dialog(transient_for=self, modal=True)
+        self.browse_dialog = dialog
+        dialog.set_title("Choose application")
+        dialog.set_default_size(560, 420)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        content.set_margin_top(18)
+        content.set_margin_bottom(18)
+        content.set_margin_start(18)
+        content.set_margin_end(18)
+        dialog.get_content_area().append(content)
+
+        search_entry = Gtk.SearchEntry()
+        search_entry.set_placeholder_text("Search installed applications…")
+        search_entry.set_hexpand(True)
+        content.append(search_entry)
+
+        scrolled_window = Gtk.ScrolledWindow()
+        scrolled_window.set_hexpand(True)
+        scrolled_window.set_vexpand(True)
+        scrolled_window.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        content.append(scrolled_window)
+
+        self.browse_list = Gtk.ListBox()
+        self.browse_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.browse_list.set_activate_on_single_click(False)
+        self.browse_list.connect("row-activated", self.on_browse_row_activated)
+        scrolled_window.set_child(self.browse_list)
+
+        for info in self.get_desktop_apps():
+            row = Gtk.ListBoxRow()
+            row.desktop_info = info
+
+            row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+            row_box.set_margin_top(10)
+            row_box.set_margin_bottom(10)
+            row_box.set_margin_start(12)
+            row_box.set_margin_end(12)
+
+            name_label = Gtk.Label(label=info.get_name(), halign=Gtk.Align.START)
+            name_label.set_single_line_mode(True)
+            name_label.set_ellipsize(Pango.EllipsizeMode.END)
+            row_box.append(name_label)
+
+            executable = info.get_executable() or info.get_commandline() or ""
+            subtitle = f"{info.get_id()}  •  {executable}"
+            subtitle_label = Gtk.Label(label=subtitle, halign=Gtk.Align.START)
+            subtitle_label.add_css_class("dim-label")
+            subtitle_label.set_single_line_mode(True)
+            subtitle_label.set_ellipsize(Pango.EllipsizeMode.END)
+            row_box.append(subtitle_label)
+
+            row.set_child(row_box)
+            self.browse_list.append(row)
+
+        self.browse_query = ""
+        search_entry.connect("search-changed", self.on_browse_search_changed)
+        self.browse_list.set_filter_func(self.filter_browse_row)
+
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        select_button = dialog.add_button("_Select", Gtk.ResponseType.OK)
+        select_button.add_css_class("suggested-action")
+        dialog.set_default_widget(select_button)
+        dialog.connect("response", self.on_browse_dialog_response)
+        dialog.present()
+
+    def on_browse_search_changed(self, entry):
+        self.browse_query = entry.get_text().strip().casefold()
+        self.browse_list.invalidate_filter()
+
+    def filter_browse_row(self, row):
+        if not self.browse_query:
+            return True
+
+        info = row.desktop_info
+        haystack = "\n".join((
+            info.get_name() or "",
+            info.get_id() or "",
+            info.get_executable() or "",
+            info.get_commandline() or "",
+        )).casefold()
+
+        return self.browse_query in haystack
+
+    def on_browse_dialog_response(self, dialog, response):
+        if response != Gtk.ResponseType.OK:
+            dialog.destroy()
+            return
+
+        row = self.browse_list.get_selected_row()
+        dialog.destroy()
+
+        if row is None:
+            self.set_status("Select an application first", error=True)
+            return
+
+        self.add_desktop_app(row.desktop_info)
+
+    def on_browse_row_activated(self, _list_box, row):
+        self.add_desktop_app(row.desktop_info)
+        self.browse_dialog.destroy()
+
+    def add_desktop_app(self, info):
+        if info is None:
+            return
+
+        app_name = Path(info.get_id()).stem
+        if not app_name:
+            self.set_status("Desktop entry has no usable application ID", error=True)
+            return
+
+        if app_name in self.apps:
+            self.set_status(f"An app named {app_name} is already configured", error=True)
+            return
+
+        executable = info.get_executable()
+        if not executable:
+            commandline = info.get_commandline() or ""
+            executable = commandline.split()[0] if commandline else ""
+
+        if not executable:
+            self.set_status("Desktop entry has no executable command", error=True)
+            return
+
+        executable_path = Path(executable)
+        if not executable_path.is_absolute():
+            executable = shutil.which(executable) or ""
+
+        if not executable:
+            self.set_status("Could not resolve the application executable", error=True)
+            return
+
+        resolved_path = Path(executable).resolve(strict=True)
+        if not resolved_path.is_file() or not os.access(resolved_path, os.X_OK):
+            self.set_status(f"Could not resolve executable: {resolved_path}", error=True)
+            return
+
+        if resolved_path.name in {"flatpak", "snap"}:
+            self.set_status(
+                "Flatpak and Snap apps are not supported by the executable-path browser yet",
+                error=True,
+            )
+            return
+
+        self.apps[app_name] = {
+            "path": str(resolved_path),
+            "argv": [str(resolved_path)],
+            "schedule": {"always": True},
+        }
+        self.refresh_combo()
+        self.select_app(app_name)
+        self.set_status(f"Added {app_name} from the app menu. Choose a schedule, then apply.")
+
+    def on_remove_clicked(self, _button):
+        if self.selected_name is None:
+            return
+        name = self.selected_name
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.NONE,
+            text=f"Stop locking {name}?",
+        )
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("_Remove", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.connect("response", self.on_remove_response, name)
+        dialog.present()
+
+    def on_remove_response(self, dialog, response, name):
+        dialog.destroy()
+        if response != Gtk.ResponseType.OK or name not in self.apps:
+            return
+        del self.apps[name]
+        self.refresh_combo()
+        self.set_status(f"Removed {name}. Apply to save the change.")
+
+    def on_set_code_clicked(self, _button):
+        dialog = Gtk.Dialog(transient_for=self, modal=True)
+        dialog.set_title("Set unlock code")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(18)
+        box.set_margin_bottom(18)
+        box.set_margin_start(18)
+        box.set_margin_end(18)
+
+        code_entry = Gtk.Entry()
+        code_entry.set_visibility(False)
+        code_entry.set_placeholder_text("New code")
+        confirm_entry = Gtk.Entry()
+        confirm_entry.set_visibility(False)
+        confirm_entry.set_placeholder_text("Confirm code")
+        box.append(code_entry)
+        box.append(confirm_entry)
+        dialog.get_content_area().append(box)
+
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        dialog.add_button("_Set code", Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.connect(
+            "response",
+            self.on_set_code_response,
+            (code_entry, confirm_entry),
+        )
+        dialog.present()
+
+    def on_set_code_response(self, dialog, response, state):
+        code_entry, confirm_entry = state
+        if response != Gtk.ResponseType.OK:
+            dialog.destroy()
+            return
+
+        code = code_entry.get_text()
+        confirm = confirm_entry.get_text()
+        dialog.destroy()
+        if not code or code != confirm:
+            self.set_status("Codes do not match", error=True)
+            return
+
+        self.run_admin_async(
+            ["pkexec", ADMIN_TOOL, "set-code-stdin"],
+            "Unlock code updated",
+            "Unable to set unlock code",
+            stdin_data=code + "\n",
+        )
+
+    def on_sync_clicked(self, _button):
+        self.run_admin_async(
+            ["pkexec", ADMIN_TOOL, "sync"],
+            "App Lock rules and website blocks synchronized",
+            "Unable to synchronize App Lock rules and website blocks",
+        )
+
+    def on_apply_clicked(self, _button):
+        if self.applying:
+            return
+        if not self.validate_config():
+            return
+
+        fd, temp_path = tempfile.mkstemp(prefix="applock-gui-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    {"apps": self.apps, "websites": self.websites},
+                    handle,
+                    indent=2,
+                )
+        except Exception as exc:
+            self.set_status(f"Unable to write configuration: {exc}", error=True)
+            return
+
+        self.run_admin_async(
+            ["pkexec", ADMIN_TOOL, "apply-config", temp_path],
+            "Configuration applied",
+            "Unable to apply configuration",
+            cleanup=temp_path,
+        )
+
+    def validate_config(self):
+        if not self.apps and not self.websites:
+            self.set_status("Add at least one application or website", error=True)
+            return False
+
+        for name, app in self.apps.items():
+            path = app.get("path")
+            if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+                self.set_status(f"{name}: executable path is invalid", error=True)
+                return False
+
+            schedule = app.get("schedule", {"always": True})
+            if schedule.get("always", True):
+                continue
+
+            start = common.parse_time(schedule.get("start"))
+            end = common.parse_time(schedule.get("end"))
+            if start is None or end is None:
+                self.set_status(f"{name}: use HH:MM lock times", error=True)
+                return False
+
+            schedule["start"] = f"{start // 60:02d}:{start % 60:02d}"
+            schedule["end"] = f"{end // 60:02d}:{end % 60:02d}"
+
+        for name, website in self.websites.items():
+            if not isinstance(website, dict):
+                self.set_status(f"{name}: invalid website entry", error=True)
+                return False
+
+            try:
+                common.parse_website(name)
+                domains = website.get("domains", [name])
+                if not isinstance(domains, list):
+                    raise ValueError(f"{name}: blocked hosts must be a list")
+                for domain in domains:
+                    common.normalize_domain(domain)
+            except ValueError as exc:
+                self.set_status(str(exc), error=True)
+                return False
+
+            schedule = website.get("schedule", {"always": True})
+            if schedule.get("always", True):
+                continue
+
+            start = common.parse_time(schedule.get("start"))
+            end = common.parse_time(schedule.get("end"))
+            if start is None or end is None:
+                self.set_status(f"{name}: use HH:MM blocking times", error=True)
+                return False
+
+            schedule["start"] = f"{start // 60:02d}:{start % 60:02d}"
+            schedule["end"] = f"{end // 60:02d}:{end % 60:02d}"
+
+        return True
+
+    def run_admin_async(self, command, success_message, error_message, cleanup=None, stdin_data=None):
+        if self.applying:
+            return
+        self.applying = True
+        self.apply_button.set_sensitive(False)
+        self.sync_button.set_sensitive(False)
+        self.set_status("Waiting for administrator authorization…")
+        thread = threading.Thread(
+            target=self.run_admin_thread,
+            args=(command, success_message, error_message, cleanup, stdin_data),
+            daemon=True,
+        )
+        thread.start()
+
+    def run_admin_thread(self, command, success_message, error_message, cleanup=None, stdin_data=None):
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                input=stdin_data,
+                text=True,
+                check=False,
+            )
+            output = result.stdout.strip()
+            error = result.stderr.strip()
+            success = result.returncode == 0
+        except Exception as exc:
+            success = False
+            output = ""
+            error = str(exc)
+        finally:
+            if cleanup:
+                try:
+                    os.unlink(cleanup)
+                except Exception:
+                    pass
+
+        GLib.idle_add(self.finish_admin_command, success, output, error, success_message, error_message)
+
+    def finish_admin_command(self, success, output, error, success_message, error_message):
+        self.applying = False
+        self.apply_button.set_sensitive(True)
+        self.sync_button.set_sensitive(True)
+
+        if success:
+            self.set_status(output or success_message)
+            self.load_config()
+        else:
+            self.set_status(error or output or error_message, error=True)
+        return False
+
+
+if __name__ == "__main__":
+    app = AppLockAdmin()
+    exit_status = app.run(sys.argv)
+    sys.exit(exit_status)

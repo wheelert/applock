@@ -1,0 +1,113 @@
+#!/usr/bin/python3
+import getpass
+import json
+import os
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "/usr/local/lib/applock")
+import applock_common as common
+
+SOCKET_PATH = os.environ.get("APPLOCK_SOCKET", "/run/applock/applock.sock")
+CONFIG_PATH = Path(os.environ.get("APPLOCK_APPS", "/etc/applock/apps.json"))
+MAX_RESPONSE_SIZE = 64 * 1024
+SAFE_ENV = [
+    "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+    "DBUS_SYSTEM_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
+    "XDG_CURRENT_DESKTOP", "HOME", "USER", "LOGNAME", "SHELL", "PATH",
+    "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "TERM",
+]
+
+
+def ask_code(app_name):
+    try:
+        result = subprocess.run(
+            ["zenity", "--password", "--title", f"Unlock {app_name}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        if result.returncode == 0:
+            return result.stdout.rstrip("\n")
+    except Exception:
+        pass
+    return getpass.getpass(f"Unlock code for {app_name}: ")
+
+
+def load_app(app_name):
+    apps = common.load_apps(CONFIG_PATH)
+    return apps.get(app_name)
+
+
+def launch_via_daemon(app_name, code=None):
+    request = {
+        "app": app_name,
+        "code": code,
+        "env": {key: os.environ[key] for key in SAFE_ENV if key in os.environ},
+    }
+
+    client = None
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(120)
+        client.connect(SOCKET_PATH)
+        client.sendall(json.dumps(request).encode("utf-8") + b"\n")
+        chunks = []
+        total = 0
+        while total < MAX_RESPONSE_SIZE:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if b"\n" in chunk:
+                break
+        response = json.loads(b"".join(chunks).decode("utf-8"))
+        if response.get("status") == "launched":
+            return 0
+        print(response.get("message", "App Lock request failed"), file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"App Lock failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(f"Usage: {Path(sys.argv[0]).name} APP", file=sys.stderr)
+        return 2
+
+    app_name = sys.argv[1]
+    app = load_app(app_name)
+    if app is None:
+        print(f"Unknown locked app: {app_name}", file=sys.stderr)
+        return 1
+
+    if not common.schedule_is_locked(app.get("schedule")):
+        path = app["path"]
+        argv = app.get("argv") or [path]
+        try:
+            os.execve(path, argv, os.environ)
+        except PermissionError:
+            # The profile may not have refreshed yet. Fall back to the daemon.
+            return launch_via_daemon(app_name, None)
+        except Exception as exc:
+            print(f"Unable to launch {app_name}: {exc}", file=sys.stderr)
+            return 1
+
+    code = ask_code(app_name)
+    return launch_via_daemon(app_name, code)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

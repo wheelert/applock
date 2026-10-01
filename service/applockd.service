@@ -1,0 +1,19 @@
+[Unit]
+Description=App Lock daemon for apps and websites
+After=apparmor.service
+Requires=apparmor.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/applockd
+ExecReload=/bin/kill -HUP $MAINPID
+RuntimeDirectory=applock
+RuntimeDirectoryMode=0755
+Restart=always
+RestartSec=2
+User=root
+Group=root
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

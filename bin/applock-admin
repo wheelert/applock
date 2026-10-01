@@ -1,0 +1,627 @@
+#!/usr/bin/python3
+import argparse
+import grp
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, os.environ.get("APPLOCK_LIB", "/usr/local/lib/applock"))
+import applock_common as common
+
+try:
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+except Exception:
+    Gio = None
+
+ROOT = Path("/etc/applock")
+APPS_PATH = ROOT / "apps.json"
+CODE_PATH = ROOT / "code"
+APP_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
+DESKTOP_OVERRIDE_DIR = Path("/usr/local/share/applications")
+APPLOCK_LAUNCHER = "/usr/local/bin/applock-launch"
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise SystemExit("applock-admin must be run as root")
+
+
+def ensure_files():
+    group = None
+    try:
+        group = grp.getgrnam("applock").gr_gid
+    except KeyError:
+        pass
+
+    ROOT.mkdir(mode=0o755, parents=True, exist_ok=True)
+    if group is not None:
+        os.chown(ROOT, 0, group)
+    os.chmod(ROOT, 0o755)
+
+    if not APPS_PATH.exists():
+        APPS_PATH.write_text(
+            json.dumps({"apps": {}, "websites": {}}, indent=2) + "\n"
+        )
+    if group is not None:
+        os.chown(APPS_PATH, 0, group)
+    os.chmod(APPS_PATH, 0o644)
+
+    if not CODE_PATH.exists():
+        salt = uuid.uuid4().hex
+        CODE_PATH.write_text(f"salt={salt}\nhash=0\n")
+    os.chown(CODE_PATH, 0, 0)
+    os.chmod(CODE_PATH, 0o600)
+
+
+def load_config():
+    return common.load_config(APPS_PATH)
+
+
+def load_apps():
+    return load_config().get("apps", {})
+
+
+def load_websites():
+    return load_config().get("websites", {})
+
+
+def save_config(apps, websites):
+    APPS_PATH.write_text(
+        json.dumps({"apps": apps, "websites": websites}, indent=2) + "\n"
+    )
+    group = None
+    try:
+        group = grp.getgrnam("applock").gr_gid
+    except KeyError:
+        pass
+    if group is not None:
+        os.chown(APPS_PATH, 0, group)
+    os.chmod(APPS_PATH, 0o644)
+
+
+def save_apps(apps):
+    save_config(apps, load_websites())
+
+
+def save_websites(websites):
+    save_config(load_apps(), websites)
+
+
+def set_code(code):
+    ensure_files()
+    if len(code) < 4:
+        raise SystemExit("Code must be at least four characters")
+    salt = uuid.uuid4().hex
+    digest = hashlib.sha256(f"{salt}:{code}".encode()).hexdigest()
+    CODE_PATH.write_text(f"salt={salt}\nhash={digest}\n")
+    os.chown(CODE_PATH, 0, 0)
+    os.chmod(CODE_PATH, 0o600)
+    print("Unlock code updated.")
+
+
+def update_desktop_database():
+    try:
+        subprocess.run(
+            ["update-desktop-database", str(DESKTOP_OVERRIDE_DIR)],
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def desktop_info_is_override(info):
+    executable = info.get_executable()
+    commandline = info.get_commandline() or ""
+    return executable == APPLOCK_LAUNCHER or commandline.startswith(APPLOCK_LAUNCHER)
+
+
+def load_original_desktop_info(override_info):
+    app_id = override_info.get_id()
+    if not app_id:
+        return None
+
+    search_paths = [
+        Path("/usr/share/applications"),
+        Path.home() / ".local/share/applications",
+        Path("/var/lib/flatpak/exports/share/applications"),
+        DESKTOP_OVERRIDE_DIR,
+    ]
+    for directory in search_paths:
+        path = directory / app_id
+        if not path.is_file():
+            continue
+        try:
+            info = Gio.DesktopAppInfo.new_from_filename(str(path))
+        except Exception:
+            continue
+        if info and not desktop_info_is_override(info):
+            return info
+    return None
+
+
+def resolved_executable(executable):
+    if not executable:
+        return None
+    candidate = Path(executable)
+    if not candidate.is_absolute():
+        candidate = Path(shutil.which(executable) or executable)
+    try:
+        candidate = candidate.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
+
+def find_desktop_info(name, path):
+    if Gio is None:
+        return None
+
+    needle = name.casefold()
+    resolved_path = Path(path).resolve(strict=False)
+    infos = []
+    for info in Gio.DesktopAppInfo.get_all():
+        if desktop_info_is_override(info):
+            info = load_original_desktop_info(info)
+            if info is None:
+                continue
+        infos.append(info)
+
+    for info in infos:
+        if resolved_executable(info.get_executable()) == resolved_path:
+            return info
+
+    for info in infos:
+        desktop_id = (info.get_id() or "").casefold()
+        desktop_name = (info.get_name() or "").casefold()
+        if desktop_id == f"{needle}.desktop" or desktop_name == needle:
+            return info
+    return None
+
+
+def install_desktop_override(name, path):
+    if Gio is None:
+        return None
+    info = find_desktop_info(name, path)
+    if info is None:
+        return None
+
+    source = Path(info.get_filename())
+    DESKTOP_OVERRIDE_DIR.mkdir(parents=True, exist_ok=True)
+    target = DESKTOP_OVERRIDE_DIR / source.name
+    lines = []
+    replaced_try_exec = False
+
+    for line in source.read_text(encoding="utf-8").splitlines():
+        if line.startswith("Exec="):
+            lines.append(f"Exec={APPLOCK_LAUNCHER} {name}")
+        elif line.startswith("TryExec="):
+            lines.append(f"TryExec={APPLOCK_LAUNCHER}")
+            replaced_try_exec = True
+        else:
+            lines.append(line)
+
+    if not replaced_try_exec:
+        lines.append(f"TryExec={APPLOCK_LAUNCHER}")
+    lines.append("X-AppLock=1")
+
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chown(target, 0, 0)
+    os.chmod(target, 0o644)
+    update_desktop_database()
+    return info.get_id()
+
+
+def remove_desktop_override(desktop_id):
+    if not desktop_id:
+        return
+    target = DESKTOP_OVERRIDE_DIR / desktop_id
+    if target.exists():
+        target.unlink()
+    update_desktop_database()
+
+
+def normalize_schedule(schedule):
+    if not isinstance(schedule, dict) or schedule.get("always", True):
+        return {"always": True}
+
+    start = common.parse_time(schedule.get("start"))
+    end = common.parse_time(schedule.get("end"))
+    if start is None or end is None:
+        raise ValueError("Schedule times must be in HH:MM format")
+
+    return {
+        "always": False,
+        "start": f"{start // 60:02d}:{start % 60:02d}",
+        "end": f"{end // 60:02d}:{end % 60:02d}",
+    }
+
+
+def normalize_website(name, info):
+    if not isinstance(info, dict):
+        raise ValueError(f"Invalid website entry: {name}")
+
+    primary, domains = common.parse_website(info.get("domain") or name)
+    raw_domains = info.get("domains")
+    if raw_domains is not None:
+        if not isinstance(raw_domains, list) or not all(
+            isinstance(domain, str) for domain in raw_domains
+        ):
+            raise ValueError(f"Website {primary} has an invalid domains list")
+        domains = [common.normalize_domain(domain) for domain in raw_domains]
+
+    if primary not in domains:
+        domains.insert(0, primary)
+
+    return {
+        "domain": primary,
+        "domains": list(dict.fromkeys(domains)),
+        "schedule": normalize_schedule(info.get("schedule")),
+    }
+
+
+def normalize_websites(raw_websites):
+    websites = {}
+    for raw_name, info in raw_websites.items():
+        website = normalize_website(raw_name, info)
+        key = website["domain"]
+        if key in websites:
+            raise ValueError(f"Duplicate website: {key}")
+        websites[key] = website
+    return dict(sorted(websites.items()))
+
+
+def normalize_app(name, info):
+    if not APP_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "App names may contain letters, numbers, dot, dash, and underscore only"
+        )
+    if not isinstance(info, dict):
+        raise ValueError(f"Invalid app entry: {name}")
+
+    raw_path = info.get("path")
+    argv = info.get("argv")
+    if argv is not None and (
+        not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
+    ):
+        raise ValueError(f"App {name} has invalid arguments")
+
+    # Recover configurations created by older versions that mistakenly stored
+    # the launcher itself as the executable path.
+    if raw_path == APPLOCK_LAUNCHER:
+        if not argv:
+            raise ValueError(f"App {name} has no executable path")
+        raw_path = argv[0]
+
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError(f"App {name} has no executable path")
+
+    try:
+        resolved = Path(raw_path).resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"Not an executable file: {raw_path}") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ValueError(f"Not an executable file: {resolved}")
+
+    desktop_info = find_desktop_info(name, resolved)
+    if desktop_info is not None:
+        executable = resolved_executable(desktop_info.get_executable())
+        if executable is not None:
+            resolved = executable
+
+    desktop_id = install_desktop_override(name, resolved)
+    normalized_argv = argv or [str(resolved)]
+
+    normalized = {
+        "path": str(resolved),
+        "argv": normalized_argv,
+        "schedule": normalize_schedule(info.get("schedule")),
+    }
+    if desktop_id:
+        normalized["desktop_id"] = desktop_id
+    return normalized
+
+
+def signal_daemon():
+    subprocess.run(
+        ["systemctl", "kill", "--signal=HUP", "applockd.service"],
+        check=False,
+    )
+
+
+def apply_config(config_path):
+    ensure_files()
+    with Path(config_path).open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    raw_apps = data.get("apps", {})
+    raw_websites = data.get("websites", {})
+    if not isinstance(raw_apps, dict):
+        raise ValueError("Configuration must contain an apps object")
+    if not isinstance(raw_websites, dict):
+        raise ValueError("Configuration must contain a websites object")
+
+    apps = {name: normalize_app(name, info) for name, info in raw_apps.items()}
+    websites = normalize_websites(raw_websites)
+    save_config(apps, websites)
+    common.sync_profile(apps)
+    common.sync_website_blocks(websites)
+    signal_daemon()
+    print("App Lock configuration applied.")
+
+
+def add_app(name, path, args, schedule=None):
+    ensure_files()
+    apps = load_apps()
+    apps[name] = normalize_app(name, {
+        "path": path,
+        "argv": [path, *args],
+        "schedule": schedule or {"always": True},
+    })
+    save_apps(apps)
+    common.sync_profile(apps)
+    signal_daemon()
+    print(f"Added {name}: {apps[name]['path']}")
+
+
+def remove_app(name):
+    ensure_files()
+    apps = load_apps()
+    if name not in apps:
+        raise SystemExit(f"Unknown app: {name}")
+    info = apps.pop(name)
+    remove_desktop_override(info.get("desktop_id"))
+    save_apps(apps)
+    common.sync_profile(apps)
+    signal_daemon()
+    print(f"Removed {name}")
+
+
+def set_schedule(name, schedule):
+    ensure_files()
+    apps = load_apps()
+    if name not in apps:
+        raise SystemExit(f"Unknown app: {name}")
+    apps[name]["schedule"] = normalize_schedule(schedule)
+    save_apps(apps)
+    common.sync_profile(apps)
+    signal_daemon()
+    print(f"Schedule updated for {name}.")
+
+
+def add_website(domain, schedule):
+    ensure_files()
+    websites = load_websites()
+    normalized = normalize_website(domain, {
+        "domain": domain,
+        "schedule": schedule or {"always": True},
+    })
+    key = normalized["domain"]
+    if key in websites:
+        raise SystemExit(f"Website is already configured: {key}")
+    websites[key] = normalized
+    save_websites(websites)
+    common.sync_website_blocks(websites)
+    signal_daemon()
+    print(f"Added website: {key}")
+
+
+def remove_website(domain):
+    ensure_files()
+    websites = load_websites()
+    key = common.parse_website(domain)[0]
+    if key not in websites:
+        raise SystemExit(f"Unknown website: {key}")
+    del websites[key]
+    save_websites(websites)
+    common.sync_website_blocks(websites)
+    signal_daemon()
+    print(f"Removed website: {key}")
+
+
+def set_website_schedule(domain, schedule):
+    ensure_files()
+    websites = load_websites()
+    key = common.parse_website(domain)[0]
+    if key not in websites:
+        raise SystemExit(f"Unknown website: {key}")
+    websites[key]["schedule"] = normalize_schedule(schedule)
+    save_websites(websites)
+    common.sync_website_blocks(websites)
+    signal_daemon()
+    print(f"Schedule updated for {key}.")
+
+
+def describe_schedule(schedule):
+    if schedule.get("always", True):
+        return "always"
+    return f"{schedule.get('start')}–{schedule.get('end')}"
+
+
+def list_config():
+    ensure_files()
+    config = load_config()
+    apps = config.get("apps", {})
+    websites = config.get("websites", {})
+
+    if not apps and not websites:
+        print("No apps or websites are configured.")
+        return
+
+    for name, info in apps.items():
+        when = describe_schedule(info.get("schedule", {"always": True}))
+        print(f"app {name}: {info['path']} [{when}]")
+
+    for name, info in websites.items():
+        when = describe_schedule(info.get("schedule", {"always": True}))
+        hosts = ", ".join(info.get("domains", [name]))
+        print(f"website {name}: {hosts} [{when}]")
+
+
+def sync():
+    ensure_files()
+    config = load_config()
+    apps = {
+        name: normalize_app(name, info)
+        for name, info in config.get("apps", {}).items()
+    }
+    websites = normalize_websites(config.get("websites", {}))
+    save_config(apps, websites)
+    common.sync_profile(apps)
+    common.sync_website_blocks(websites)
+    signal_daemon()
+    print("App Lock profiles and website blocks synchronized.")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Configure AppArmor App Lock")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    code_parser = subparsers.add_parser("set-code", help="Set the unlock code")
+    code_parser.add_argument("code")
+    subparsers.add_parser(
+        "set-code-stdin", help="Read a new unlock code from standard input"
+    )
+
+    add_parser = subparsers.add_parser("add", help="Add a locked app")
+    add_parser.add_argument("name")
+    add_parser.add_argument("path")
+    add_parser.add_argument("args", nargs="*")
+    app_add_schedule = add_parser.add_mutually_exclusive_group()
+    app_add_schedule.add_argument(
+        "--always", action="store_true", help="Lock the app at all times"
+    )
+    app_add_schedule.add_argument(
+        "--schedule", nargs=2, metavar=("START", "END"),
+        help="Daily lock window in HH:MM format",
+    )
+
+    remove_parser = subparsers.add_parser("remove", help="Remove a locked app")
+    remove_parser.add_argument("name")
+
+    website_add_parser = subparsers.add_parser(
+        "add-website", help="Add a blocked website"
+    )
+    website_add_parser.add_argument(
+        "domain", help="Domain or URL, such as example.com"
+    )
+    website_add_schedule = website_add_parser.add_mutually_exclusive_group()
+    website_add_schedule.add_argument(
+        "--always", action="store_true", help="Block the website at all times"
+    )
+    website_add_schedule.add_argument(
+        "--schedule", nargs=2, metavar=("START", "END"),
+        help="Daily block window in HH:MM format",
+    )
+
+    website_remove_parser = subparsers.add_parser(
+        "remove-website", help="Remove a blocked website"
+    )
+    website_remove_parser.add_argument("domain", help="Domain or URL")
+
+    website_schedule_parser = subparsers.add_parser(
+        "set-website-schedule", help="Set when a website is blocked"
+    )
+    website_schedule_parser.add_argument("domain", help="Domain or URL")
+    website_schedule_group = website_schedule_parser.add_mutually_exclusive_group()
+    website_schedule_group.add_argument(
+        "--always", action="store_true", help="Block the website at all times"
+    )
+    website_schedule_group.add_argument(
+        "--schedule", nargs=2, metavar=("START", "END"),
+        help="Daily block window in HH:MM format",
+    )
+
+    schedule_parser = subparsers.add_parser(
+        "set-schedule", help="Set when an app is locked"
+    )
+    schedule_parser.add_argument("name")
+    app_schedule_group = schedule_parser.add_mutually_exclusive_group()
+    app_schedule_group.add_argument(
+        "--always", action="store_true", help="Lock the app at all times"
+    )
+    app_schedule_group.add_argument(
+        "--schedule", nargs=2, metavar=("START", "END"),
+        help="Daily lock window in HH:MM format",
+    )
+
+    subparsers.add_parser(
+        "list", help="List locked apps and blocked websites"
+    )
+    apply_parser = subparsers.add_parser(
+        "apply-config", help="Apply a JSON configuration file"
+    )
+    apply_parser.add_argument("config")
+    subparsers.add_parser(
+        "sync", help="Regenerate AppArmor rules and website blocks"
+    )
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    require_root()
+    ensure_files()
+
+    if args.command == "set-code":
+        set_code(args.code)
+    elif args.command == "set-code-stdin":
+        set_code(sys.stdin.readline().rstrip("\n"))
+    elif args.command == "add":
+        schedule = {"always": True}
+        if args.schedule:
+            schedule = {
+                "always": False,
+                "start": args.schedule[0],
+                "end": args.schedule[1],
+            }
+        add_app(args.name, args.path, args.args, schedule)
+    elif args.command == "remove":
+        remove_app(args.name)
+    elif args.command == "set-schedule":
+        schedule = {"always": True}
+        if args.schedule:
+            schedule = {
+                "always": False,
+                "start": args.schedule[0],
+                "end": args.schedule[1],
+            }
+        set_schedule(args.name, schedule)
+    elif args.command == "add-website":
+        schedule = {"always": True}
+        if args.schedule:
+            schedule = {
+                "always": False,
+                "start": args.schedule[0],
+                "end": args.schedule[1],
+            }
+        add_website(args.domain, schedule)
+    elif args.command == "remove-website":
+        remove_website(args.domain)
+    elif args.command == "set-website-schedule":
+        schedule = {"always": True}
+        if args.schedule:
+            schedule = {
+                "always": False,
+                "start": args.schedule[0],
+                "end": args.schedule[1],
+            }
+        set_website_schedule(args.domain, schedule)
+    elif args.command == "list":
+        list_config()
+    elif args.command == "apply-config":
+        apply_config(args.config)
+    elif args.command == "sync":
+        sync()
+
+
+if __name__ == "__main__":
+    main()

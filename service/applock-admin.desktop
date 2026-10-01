@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=AppLockConfig
+Comment=Configure AppArmor application locks and website blocks
+Exec=/usr/local/bin/applock-admin-gui
+Icon=system-lock-screen-symbolic
+Terminal=false
+Categories=System;Security;Utility;
+Keywords=applock;parental;apparmor;lock;security;website;web;website;web;
+StartupWMClass=org.thomas.AppLockConfig
+X-GNOME-UsesNotifications=false
