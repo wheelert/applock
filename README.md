@@ -80,7 +80,9 @@ applock-admin-gui
 
 The GUI can:
 
-- add and remove locked applications and blocked websites
+- add locked applications from executable paths or the desktop app menu
+- add Flatpak applications by application ID or installed Flatpak launcher
+- remove locked applications and blocked websites
 - set the unlock code
 - choose whether each item is always active
 - set daily windows, such as `19:00` to `07:00`

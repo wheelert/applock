@@ -132,6 +132,7 @@ def load_original_desktop_info(override_info):
         Path("/usr/share/applications"),
         Path.home() / ".local/share/applications",
         Path("/var/lib/flatpak/exports/share/applications"),
+        Path.home() / ".local/share/flatpak/exports/share/applications",
         DESKTOP_OVERRIDE_DIR,
     ]
     for directory in search_paths:
@@ -188,14 +189,36 @@ def find_desktop_info(name, path):
     return None
 
 
-def install_desktop_override(name, path):
+def desktop_source_path(desktop_id):
+    """Find the original desktop entry outside the App Lock overrides."""
+    directories = [
+        Path("/usr/share/applications"),
+        Path.home() / ".local/share/applications",
+        Path("/var/lib/flatpak/exports/share/applications"),
+        Path.home() / ".local/share/flatpak/exports/share/applications",
+    ]
+    for directory in directories:
+        path = directory / desktop_id
+        if path.is_file():
+            return path
+    return None
+
+
+def install_desktop_override(name, path, desktop_id=None):
     if Gio is None:
         return None
-    info = find_desktop_info(name, path)
-    if info is None:
-        return None
 
-    source = Path(info.get_filename())
+    if desktop_id:
+        source = desktop_source_path(desktop_id)
+        if source is None:
+            return None
+    else:
+        info = find_desktop_info(name, path)
+        if info is None:
+            return None
+        source = Path(info.get_filename())
+        desktop_id = info.get_id()
+
     DESKTOP_OVERRIDE_DIR.mkdir(parents=True, exist_ok=True)
     target = DESKTOP_OVERRIDE_DIR / source.name
     lines = []
@@ -218,7 +241,7 @@ def install_desktop_override(name, path):
     os.chown(target, 0, 0)
     os.chmod(target, 0o644)
     update_desktop_database()
-    return info.get_id()
+    return desktop_id
 
 
 def remove_stale_desktop_overrides(apps):
@@ -239,14 +262,22 @@ def remove_stale_desktop_overrides(apps):
     update_desktop_database()
 
 
-def restore_desktop_override(desktop_id, path):
-    """Keep a launcher visible while removing App Lock behavior from it."""
+def restore_original_desktop_override(desktop_id):
+    """Keep the launcher while removing App Lock behavior."""
     if not desktop_id:
         return
+
     target = DESKTOP_OVERRIDE_DIR / desktop_id
     if not target.exists():
         return
-    target.write_text(f"Exec={path}", encoding="utf-8")
+
+    source = desktop_source_path(desktop_id)
+    if source is None:
+        target.unlink()
+    else:
+        target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        os.chown(target, 0, 0)
+        os.chmod(target, 0o644)
     update_desktop_database()
 
 
@@ -317,15 +348,32 @@ def normalize_app(name, info):
     if not isinstance(info, dict):
         raise ValueError(f"Invalid app entry: {name}")
 
-    raw_path = info.get("path")
     argv = info.get("argv")
     if argv is not None and (
         not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
     ):
         raise ValueError(f"App {name} has invalid arguments")
 
-    # Recover configurations created by older versions that mistakenly stored
-    # the launcher itself as the executable path.
+    flatpak_id = info.get("flatpak_id")
+    if flatpak_id:
+        if not isinstance(flatpak_id, str) or not APP_NAME_RE.fullmatch(flatpak_id):
+            raise ValueError("Invalid Flatpak application ID")
+        resolved = Path("/usr/bin/flatpak")
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise ValueError("Flatpak is not installed")
+        desktop_id = f"{flatpak_id}.desktop"
+        install_desktop_override(name, resolved, desktop_id=desktop_id)
+        normalized_argv = argv or [str(resolved), "run", flatpak_id]
+        return {
+            "path": str(resolved),
+            "argv": normalized_argv,
+            "schedule": normalize_schedule(info.get("schedule")),
+            "type": "flatpak",
+            "flatpak_id": flatpak_id,
+            "desktop_id": desktop_id,
+        }
+
+    raw_path = info.get("path")
     if raw_path == APPLOCK_LAUNCHER:
         if not argv:
             raise ValueError(f"App {name} has no executable path")
@@ -378,9 +426,16 @@ def apply_config(config_path):
     if not isinstance(raw_websites, dict):
         raise ValueError("Configuration must contain a websites object")
 
+    old_apps = load_apps()
     apps = {name: normalize_app(name, info) for name, info in raw_apps.items()}
     websites = normalize_websites(raw_websites)
     save_config(apps, websites)
+    for name, old_info in old_apps.items():
+        if name in apps:
+            continue
+        desktop_id = old_info.get("desktop_id")
+        if desktop_id:
+            restore_original_desktop_override(desktop_id)
     remove_stale_desktop_overrides(apps)
     common.sync_profile(apps)
     common.sync_website_blocks(websites)
@@ -410,7 +465,7 @@ def remove_app(name):
     info = apps.pop(name)
     desktop_id = info.get("desktop_id")
     if desktop_id:
-        restore_desktop_override(desktop_id, info.get("path", ""))
+        restore_original_desktop_override(desktop_id)
     elif info.get("path"):
         pass  # Apps without a desktop entry are CLI-only and do not affect the app menu.
     save_apps(apps)
@@ -429,6 +484,21 @@ def set_schedule(name, schedule):
     common.sync_profile(apps)
     signal_daemon()
     print(f"Schedule updated for {name}.")
+
+
+def add_flatpak(name, flatpak_id, schedule=None):
+    """Add a locked Flatpak by its application ID."""
+    ensure_files()
+    apps = load_apps()
+    apps[name] = normalize_app(name, {
+        "type": "flatpak",
+        "flatpak_id": flatpak_id,
+        "schedule": schedule or {"always": True},
+    })
+    save_apps(apps)
+    common.sync_profile(apps)
+    signal_daemon()
+    print(f"Added Flatpak {name}: {flatpak_id}")
 
 
 def add_website(domain, schedule):
@@ -539,6 +609,20 @@ def build_parser():
         help="Daily lock window in HH:MM format",
     )
 
+    add_flatpak_parser = subparsers.add_parser(
+        "add-flatpak", help="Add a locked Flatpak by application ID"
+    )
+    add_flatpak_parser.add_argument("name")
+    add_flatpak_parser.add_argument("flatpak_id")
+    flatpak_add_schedule = add_flatpak_parser.add_mutually_exclusive_group()
+    flatpak_add_schedule.add_argument(
+        "--always", action="store_true", help="Lock the app at all times"
+    )
+    flatpak_add_schedule.add_argument(
+        "--schedule", nargs=2, metavar=("START", "END"),
+        help="Daily lock window in HH:MM format",
+    )
+
     remove_parser = subparsers.add_parser("remove", help="Remove a locked app")
     remove_parser.add_argument("name")
 
@@ -619,6 +703,15 @@ def main():
                 "end": args.schedule[1],
             }
         add_app(args.name, args.path, args.args, schedule)
+    elif args.command == "add-flatpak":
+        schedule = {"always": True}
+        if args.schedule:
+            schedule = {
+                "always": False,
+                "start": args.schedule[0],
+                "end": args.schedule[1],
+            }
+        add_flatpak(args.name, args.flatpak_id, schedule)
     elif args.command == "remove":
         remove_app(args.name)
     elif args.command == "set-schedule":

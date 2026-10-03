@@ -173,6 +173,11 @@ class AppLockWindow(Gtk.ApplicationWindow):
         browse_button.connect("clicked", self.on_browse_apps_clicked)
         app_box.append(browse_button)
 
+        flatpak_button = Gtk.Button(label="Flatpak…")
+        flatpak_button.set_tooltip_text("Add a Flatpak application by its application ID")
+        flatpak_button.connect("clicked", self.on_add_flatpak_clicked)
+        app_box.append(flatpak_button)
+
         remove_button = Gtk.Button(label="Remove")
         remove_button.add_css_class("destructive-action")
         remove_button.connect("clicked", self.on_remove_clicked)
@@ -205,6 +210,15 @@ class AppLockWindow(Gtk.ApplicationWindow):
         grid.attach(path_label, 0, row, 1, 1)
         self.path_value = Gtk.Label(halign=Gtk.Align.START, selectable=True, wrap=True)
         grid.attach(self.path_value, 1, row, 1, 1)
+        row += 1
+
+        self.flatpak_id_label = Gtk.Label(label="Flatpak app ID", halign=Gtk.Align.START)
+        self.flatpak_id_label.add_css_class("heading")
+        grid.attach(self.flatpak_id_label, 0, row, 1, 1)
+        self.flatpak_id_value = Gtk.Label(halign=Gtk.Align.START, selectable=True, wrap=True)
+        grid.attach(self.flatpak_id_value, 1, row, 1, 1)
+        self.flatpak_id_label.set_visible(False)
+        self.flatpak_id_value.set_visible(False)
         row += 1
 
         always_label = Gtk.Label(label="Always locked", halign=Gtk.Align.START)
@@ -597,6 +611,9 @@ class AppLockWindow(Gtk.ApplicationWindow):
         ):
             widget.set_sensitive(enabled)
 
+        self.flatpak_id_label.set_visible(False)
+        self.flatpak_id_value.set_visible(False)
+        self.flatpak_id_value.set_text("")
         if app is None:
             self.name_value.set_text("No locked apps")
             self.path_value.set_text("")
@@ -606,10 +623,15 @@ class AppLockWindow(Gtk.ApplicationWindow):
             self.status_value.set_text("")
             return
 
+        is_flatpak = app.get("type") == "flatpak"
+        self.flatpak_id_label.set_visible(is_flatpak)
+        self.flatpak_id_value.set_visible(is_flatpak)
         schedule = app.get("schedule", {"always": True})
         always = bool(schedule.get("always", True))
         self.name_value.set_text(self.selected_name)
         self.path_value.set_text(app.get("path", ""))
+        if is_flatpak:
+            self.flatpak_id_value.set_text(app.get("flatpak_id", ""))
         self.always_switch.set_active(always)
         self.start_entry.set_text(schedule.get("start", ""))
         self.end_entry.set_text(schedule.get("end", ""))
@@ -731,6 +753,7 @@ class AppLockWindow(Gtk.ApplicationWindow):
             Path("/usr/share/applications"),
             Path.home() / ".local/share/applications",
             Path("/var/lib/flatpak/exports/share/applications"),
+            Path.home() / ".local/share/flatpak/exports/share/applications",
             Path("/usr/local/share/applications"),
         ]
 
@@ -852,6 +875,123 @@ class AppLockWindow(Gtk.ApplicationWindow):
         self.add_desktop_app(row.desktop_info)
         self.browse_dialog.destroy()
 
+    def get_flatpak_apps(self):
+        """Return installed, user-visible Flatpak launchers by application ID."""
+        apps_by_id = {}
+        for info in self.get_desktop_apps():
+            flatpak_id = info.get_string("X-Flatpak")
+            if flatpak_id:
+                apps_by_id[flatpak_id.strip()] = info
+        return sorted(apps_by_id.items(), key=lambda item: item[0].casefold())
+
+    def on_add_flatpak_clicked(self, _button):
+        dialog = Gtk.Dialog(transient_for=self, modal=True)
+        dialog.set_title("Add Flatpak")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_margin_top(18)
+        box.set_margin_bottom(18)
+        box.set_margin_start(18)
+        box.set_margin_end(18)
+        dialog.get_content_area().append(box)
+
+        self.flatpak_choices = self.get_flatpak_apps()
+        self.flatpak_list = Gtk.StringList()
+        for app_id, info in self.flatpak_choices:
+            label = f"{info.get_name()} — {app_id}" if info.get_name() else app_id
+            self.flatpak_list.append(label)
+
+        installed_label = Gtk.Label(label="Installed Flatpak apps", halign=Gtk.Align.START)
+        installed_label.add_css_class("heading")
+        box.append(installed_label)
+
+        self.flatpak_choice_dropdown = Gtk.DropDown.new(self.flatpak_list)
+        self.flatpak_choice_dropdown.set_hexpand(True)
+        box.append(self.flatpak_choice_dropdown)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(10)
+        grid.set_column_spacing(10)
+        box.append(grid)
+
+        name_label = Gtk.Label(label="Application name", halign=Gtk.Align.START)
+        self.flatpak_name_entry = Gtk.Entry()
+        self.flatpak_name_entry.set_placeholder_text("GIMP")
+        grid.attach(name_label, 0, 0, 1, 1)
+        grid.attach(self.flatpak_name_entry, 1, 0, 1, 1)
+
+        id_label = Gtk.Label(label="Application ID", halign=Gtk.Align.START)
+        self.flatpak_id_entry = Gtk.Entry()
+        self.flatpak_id_entry.set_placeholder_text("org.gimp.GIMP")
+        self.flatpak_id_entry.set_width_chars(28)
+        grid.attach(id_label, 0, 1, 1, 1)
+        grid.attach(self.flatpak_id_entry, 1, 1, 1, 1)
+
+        self.flatpak_choice_dropdown.connect(
+            "notify::selected",
+            self.on_flatpak_choice_changed,
+        )
+        if self.flatpak_choices:
+            self.flatpak_choice_dropdown.set_selected(0)
+            self.on_flatpak_choice_changed(self.flatpak_choice_dropdown, None)
+
+        dialog.add_button("_Cancel", Gtk.ResponseType.CANCEL)
+        add_button = dialog.add_button("_Add", Gtk.ResponseType.OK)
+        add_button.add_css_class("suggested-action")
+        dialog.set_default_response(Gtk.ResponseType.OK)
+        dialog.connect("response", self.on_add_flatpak_response)
+        dialog.present()
+
+    def on_flatpak_choice_changed(self, dropdown, _param):
+        selected = dropdown.get_selected()
+        if selected == Gtk.INVALID_LIST_POSITION or selected >= len(self.flatpak_choices):
+            return
+
+        flatpak_id, _info = self.flatpak_choices[selected]
+        self.flatpak_id_entry.set_text(flatpak_id)
+        self.flatpak_name_entry.set_text(Path(flatpak_id).stem)
+
+    def on_add_flatpak_response(self, dialog, response):
+        if response == Gtk.ResponseType.OK:
+            flatpak_id = self.flatpak_id_entry.get_text().strip()
+            display_name = self.flatpak_name_entry.get_text().strip()
+            dialog.destroy()
+            if not flatpak_id:
+                self.set_status("Enter a Flatpak application ID", error=True)
+                return
+            if not display_name:
+                display_name = Path(flatpak_id).stem
+            self.add_flatpak_app(flatpak_id, display_name)
+        else:
+            dialog.destroy()
+
+    def add_flatpak_app(self, flatpak_id, display_name):
+        flatpak_id = flatpak_id.strip()
+        display_name = display_name.strip()
+        if not flatpak_id:
+            self.set_status("Flatpak application ID is required", error=True)
+            return
+        if not display_name:
+            display_name = Path(flatpak_id).stem
+        if display_name in self.apps:
+            self.set_status(f"An app named {display_name} is already configured", error=True)
+            return
+        for configured_name, info in self.apps.items():
+            if info.get("type") == "flatpak" and info.get("flatpak_id") == flatpak_id:
+                self.set_status(f"{configured_name} is already configured", error=True)
+                return
+
+        self.apps[display_name] = {
+            "path": "/usr/bin/flatpak",
+            "argv": ["/usr/bin/flatpak", "run", flatpak_id],
+            "schedule": {"always": True},
+            "type": "flatpak",
+            "flatpak_id": flatpak_id,
+        }
+        self.refresh_combo()
+        self.select_app(display_name)
+        self.set_status(f"Added Flatpak {display_name}. Choose a schedule, then apply.")
+
     def add_desktop_app(self, info):
         if info is None:
             return
@@ -866,8 +1006,8 @@ class AppLockWindow(Gtk.ApplicationWindow):
             return
 
         executable = info.get_executable()
+        commandline = info.get_commandline() or ""
         if not executable:
-            commandline = info.get_commandline() or ""
             executable = commandline.split()[0] if commandline else ""
 
         if not executable:
@@ -882,23 +1022,29 @@ class AppLockWindow(Gtk.ApplicationWindow):
             self.set_status("Could not resolve the application executable", error=True)
             return
 
-        resolved_path = Path(executable).resolve(strict=True)
-        if not resolved_path.is_file() or not os.access(resolved_path, os.X_OK):
-            self.set_status(f"Could not resolve executable: {resolved_path}", error=True)
-            return
+        if Path(executable).name == "flatpak":
+            flatpak_id = info.get_string("X-Flatpak") or app_name
 
-        if resolved_path.name in {"flatpak", "snap"}:
-            self.set_status(
-                "Flatpak and Snap apps are not supported by the executable-path browser yet",
-                error=True,
-            )
-            return
+            self.apps[app_name] = {
+                "path": executable,
+                "argv": [executable, "run", flatpak_id],
+                "schedule": {"always": True},
+                "type": "flatpak",
+                "flatpak_id": flatpak_id,
+                "desktop_id": info.get_id(),
+            }
+        else:
+            resolved_path = Path(executable).resolve(strict=True)
+            if not resolved_path.is_file() or not os.access(resolved_path, os.X_OK):
+                self.set_status(f"Could not resolve executable: {resolved_path}", error=True)
+                return
 
-        self.apps[app_name] = {
-            "path": str(resolved_path),
-            "argv": [str(resolved_path)],
-            "schedule": {"always": True},
-        }
+            self.apps[app_name] = {
+                "path": str(resolved_path),
+                "argv": [str(resolved_path)],
+                "schedule": {"always": True},
+            }
+
         self.refresh_combo()
         self.select_app(app_name)
         self.set_status(f"Added {app_name} from the app menu. Choose a schedule, then apply.")

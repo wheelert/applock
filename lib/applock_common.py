@@ -157,21 +157,34 @@ def quote_path(path):
     return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def flatpak_paths(flatpak_id):
+    return [
+        f"/var/lib/flatpak/app/{flatpak_id}",
+        f"/home/*/.local/share/flatpak/app/{flatpak_id}",
+    ]
+
+
 def generate_profile(apps, now=None):
     active = active_apps(apps, now)
 
     session_rules = []
     daemon_rules = []
     for info in apps.values():
-        path = Path(info["path"])
+        path = Path("/usr/bin/flatpak") if info.get("type") == "flatpak" else Path(info["path"])
         real = str(path.resolve(strict=False))
         daemon_rules.append(f"  {quote_path(real)} PUx,")
 
     for info in active.values():
-        path = Path(info["path"])
-        real = str(path.resolve(strict=False))
-        for deny_path in {str(path), real}:
-            session_rules.append(f"  deny {quote_path(deny_path)} mrx,")
+        if info.get("type") == "flatpak" and info.get("flatpak_id"):
+            flatpak_id = info["flatpak_id"]
+            for base in flatpak_paths(flatpak_id):
+                session_rules.append(f"  deny {quote_path(base)} mrx,")
+                session_rules.append(f"  deny {quote_path(base + '/**')} mrx,")
+        else:
+            path = Path(info["path"])
+            real = str(path.resolve(strict=False))
+            for deny_path in {str(path), real}:
+                session_rules.append(f"  deny {quote_path(deny_path)} mrx,")
 
     session_rules = sorted(set(session_rules))
     daemon_rules = sorted(set(daemon_rules))
