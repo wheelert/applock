@@ -286,7 +286,7 @@ warned_locks = set()
 closed_locks = set()
 
 
-def _notify_uid_gid(name, info):
+def _notification_uid_gid(name, info):
     """Find the desktop user to notify: configured owner, process owner, or UID 1000."""
     try:
         uid = info.get("uid")
@@ -310,6 +310,9 @@ def _notify_uid_gid(name, info):
         return pw.pw_uid, pw.pw_gid
     except KeyError:
         return None, None
+
+
+_notify_uid_gid = _notification_uid_gid
 
 
 def _warn_before_lock(app_name, start_dt, seconds_remaining, uid, gid):
@@ -337,7 +340,6 @@ def _handle_scheduled_lock(app_name, app):
 
     closed_marker = ("closed", app_name, start_dt)
 
-    # Close still-open instances once their lock window starts.
     if common.schedule_is_locked(app.get("schedule"), now.time()):
         if closed_marker not in closed_locks:
             closed_locks.add(closed_marker)
@@ -346,21 +348,9 @@ def _handle_scheduled_lock(app_name, app):
 
     remaining = (start_dt - now).total_seconds()
     if 0 <= remaining <= WARNING_SECONDS:
-        marker = ("warned", app_name, start_dt)
-        if marker not in warned_locks:
-            uid, gid = _notification_uid_gid(app_name, app)
-            if uid is None or gid is None:
-                return
-            warned_locks.add(marker)
-            log(f"scheduled lock: notified {app_name} {remaining:.0f} seconds early")
-            _notify_warning(
-                uid,
-                gid,
-                f"App Lock: {app_name} closing soon",
-                f"{app_name} will be closed at {start_dt:%H:%M}.",
-            )
-
-
+        uid, gid = _notification_uid_gid(app_name, app)
+        if uid is not None and gid is not None:
+            _warn_before_lock(app_name, start_dt, remaining, uid, gid)
 def scheduled_lock_worker():
     while not lock_sync_stop.is_set():
         try:

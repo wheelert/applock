@@ -182,6 +182,45 @@ def lock_interval(schedule, date=None):
     if end < start:
         end_dt += datetime.timedelta(days=1)
     return start_dt, end_dt
+def lock_start_at(schedule, now=None):
+    """Return the start of the current or next lock cycle."""
+    if not isinstance(schedule, dict) or schedule.get("always", True):
+        return None
+
+    start = parse_time(schedule.get("start"))
+    end = parse_time(schedule.get("end"))
+    if start is None or end is None or start == end:
+        return None
+
+    if now is None:
+        now = datetime.datetime.now()
+    if isinstance(now, datetime.time):
+        now = datetime.datetime.combine(datetime.date.today(), now)
+
+    minute = now.hour * 60 + now.minute
+
+    def start_date(day_offset):
+        return now.date() + datetime.timedelta(days=day_offset)
+
+    def at_start(day_offset):
+        day = start_date(day_offset)
+        return datetime.datetime.combine(day, datetime.time(0)) + datetime.timedelta(minutes=start)
+
+    if start < end:
+        if start <= minute < end:
+            return at_start(0)
+        if minute < start:
+            return at_start(0)
+        return at_start(1)
+
+    # A window that crosses midnight is active into the following day.
+    if minute >= start:
+        return at_start(0)
+    if minute < end:
+        return at_start(-1)
+    return at_start(0)
+
+
 def app_close_patterns(name, info):
     """Build safe-ish pkill patterns for an application."""
     if not isinstance(info, dict):
