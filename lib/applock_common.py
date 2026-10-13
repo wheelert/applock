@@ -164,6 +164,90 @@ def flatpak_paths(flatpak_id):
     ]
 
 
+def lock_interval(schedule, date=None):
+    """Return the scheduled lock window for date, or None."""
+    if not isinstance(schedule, dict) or schedule.get("always", True):
+        return None
+
+    start = parse_time(schedule.get("start"))
+    end = parse_time(schedule.get("end"))
+    if start is None or end is None or start == end:
+        return None
+
+    if date is None:
+        date = datetime.date.today()
+
+    start_dt = datetime.datetime.combine(date, datetime.time(0)) + datetime.timedelta(minutes=start)
+    end_dt = datetime.datetime.combine(date, datetime.time(0)) + datetime.timedelta(minutes=end)
+    if end < start:
+        end_dt += datetime.timedelta(days=1)
+    return start_dt, end_dt
+def app_close_patterns(name, info):
+    """Build safe-ish pkill patterns for an application."""
+    if not isinstance(info, dict):
+        return []
+
+    patterns = []
+    flatpak_id = info.get("flatpak_id")
+    if flatpak_id:
+        if isinstance(flatpak_id, str) and flatpak_id.strip():
+            patterns.append(flatpak_id.strip())
+    else:
+        path = info.get("path")
+        if isinstance(path, str) and path:
+            paths = {path, str(Path(path).resolve(strict=False))}
+            argv = info.get("argv")
+            if isinstance(argv, list) and argv and isinstance(argv[0], str):
+                paths.add(argv[0])
+            patterns.extend(paths)
+
+    name_pattern = name.strip() if isinstance(name, str) else ""
+    if name_pattern:
+        patterns.append(name_pattern)
+
+    return list(dict.fromkeys(value for value in patterns if value))
+
+
+
+def app_process_ids(name, info):
+    """Return PIDs whose command line matches the configured application."""
+    patterns = app_close_patterns(name, info)
+    if not patterns:
+        return []
+
+    pids = []
+    own_pid = os.getpid()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == own_pid:
+            continue
+
+        try:
+            raw_cmdline = (entry / "cmdline").read_bytes()
+            if not raw_cmdline:
+                continue
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        except OSError:
+            continue
+
+        argv = [
+            part.decode("utf-8", errors="ignore")
+            for part in raw_cmdline.split(b"\x00")
+            if part
+        ]
+        if not argv:
+            continue
+
+        haystack = " ".join(argv)
+        if any(pattern.casefold() in haystack.casefold() for pattern in patterns):
+            pids.append(pid)
+
+    return sorted(set(pids))
+
+
 def generate_profile(apps, now=None):
     active = active_apps(apps, now)
 

@@ -32,6 +32,8 @@ Log out and back in after installing or changing the AppArmor profile. The logou
 
 If the app has a standard desktop launcher, `applock-admin add` creates an override in `/usr/local/share/applications`. When its schedule is active, clicking the normal icon opens the password prompt. Outside the schedule, the app opens normally.
 
+For scheduled app locks, the daemon sends a desktop notification five minutes before the lock starts. If the app is still open when the lock starts, the daemon closes that running instance.
+
 You can also launch a locked app from a terminal:
 
 ```sh
@@ -39,6 +41,8 @@ applock-launch firefox
 ```
 
 The helper opens a password prompt and asks the daemon to launch the app as your user. If the app is outside its scheduled lock window, it opens directly without a prompt.
+
+Five minutes before a schedule begins, App Lock sends a desktop notification that the app will close. At the scheduled start time, the daemon closes the app if it is still running.
 
 ## Website blocking
 
@@ -88,5 +92,7 @@ The GUI can:
 - set daily windows, such as `19:00` to `07:00`
 - show whether the selected app or website is active at the current time
 - synchronize AppArmor rules and website blocks on demand
+
+Five minutes before a scheduled lock starts, App Lock sends a desktop notification that the app is about to close. If the app is still running when the lock starts, the daemon closes it.
 
 The **Applications** and **Websites** tabs use the same 24-hour time-picker controls. Changes are staged until you press **Apply**.

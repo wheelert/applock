@@ -6,6 +6,27 @@ from pathlib import Path
 import applock_common as common
 
 
+class ScheduledLockTests(unittest.TestCase):
+    def test_lock_interval_on_same_day(self):
+        start, end = common.lock_interval(
+            {"always": False, "start": "19:00", "end": "23:00"},
+            date=datetime.date(2026, 10, 12),
+        )
+        self.assertEqual(start, datetime.datetime(2026, 10, 12, 19, 0))
+        self.assertEqual(end, datetime.datetime(2026, 10, 12, 23, 0))
+
+    def test_lock_interval_crosses_midnight(self):
+        start, end = common.lock_interval(
+            {"always": False, "start": "19:00", "end": "07:00"},
+            date=datetime.date(2026, 10, 12),
+        )
+        self.assertEqual(start, datetime.datetime(2026, 10, 12, 19, 0))
+        self.assertEqual(end, datetime.datetime(2026, 10, 13, 7, 0))
+
+    def test_lock_interval_is_absent_for_always_locked(self):
+        self.assertIsNone(common.lock_interval({"always": True}))
+
+
 class WebsiteBlockingTests(unittest.TestCase):
     def test_parse_website_accepts_urls_and_adds_www(self):
         self.assertEqual(
