@@ -586,7 +586,57 @@ def sync():
     print("App Lock profiles and website blocks synchronized.")
 
 
-def build_parser():
+def _restore_export_ownership(path):
+    """Restore file ownership when exporting through pkexec."""
+    raw_uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+    raw_gid = os.environ.get("SUDO_GID")
+    if not raw_uid:
+        return
+    try:
+        uid = int(raw_uid)
+        gid = int(raw_gid) if raw_gid else -1
+    except ValueError:
+        return
+    try:
+        os.chown(path, uid, gid)
+    except OSError:
+        pass
+
+
+def export_config(path):
+    ensure_files()
+    config = load_config()
+    export = {
+        "type": "applock-config",
+        "version": 1,
+        "apps": config.get("apps", {}),
+        "websites": config.get("websites", {}),
+    }
+    destination = Path(path)
+    destination.write_text(
+        json.dumps(export, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _restore_export_ownership(destination)
+    print(f"Exported App Lock settings to {destination}.")
+
+
+def import_config(path):
+    ensure_files()
+    with Path(path).open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if not isinstance(data, dict):
+        raise ValueError("Settings file must contain a JSON object")
+    if "type" in data and data.get("type") != "applock-config":
+        raise ValueError("Settings file is not an App Lock configuration")
+    if "version" in data and int(data.get("version")) != 1:
+        raise ValueError("Unsupported App Lock settings version")
+
+    apply_config(path)
+
+
+def add_app(name, path, args, schedule=None):
     parser = argparse.ArgumentParser(description="Configure AppArmor App Lock")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -672,6 +722,16 @@ def build_parser():
         help="Daily lock window in HH:MM format",
     )
 
+    export_parser = subparsers.add_parser(
+        "export", help="Export app and website settings to JSON"
+    )
+    export_parser.add_argument("path", help="Destination JSON file")
+
+    import_parser = subparsers.add_parser(
+        "import", help="Import an App Lock settings JSON file"
+    )
+    import_parser.add_argument("path", help="JSON settings file")
+
     subparsers.add_parser(
         "list", help="List locked apps and blocked websites"
     )
@@ -747,6 +807,10 @@ def main():
         list_config()
     elif args.command == "apply-config":
         apply_config(args.config)
+    elif args.command == "export":
+        export_config(args.path)
+    elif args.command == "import":
+        import_config(args.path)
     elif args.command == "sync":
         sync()
 

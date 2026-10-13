@@ -366,6 +366,16 @@ class AppLockWindow(Gtk.ApplicationWindow):
         self.code_button.connect("clicked", self.on_set_code_clicked)
         button_box.append(self.code_button)
 
+        self.export_button = Gtk.Button(label="Export settings…")
+        self.export_button.set_tooltip_text("Save the current app and website settings to a JSON file")
+        self.export_button.connect("clicked", self.on_export_settings_clicked)
+        button_box.append(self.export_button)
+
+        self.import_button = Gtk.Button(label="Import settings…")
+        self.import_button.set_tooltip_text("Load app and website settings from a JSON file")
+        self.import_button.connect("clicked", self.on_import_settings_clicked)
+        button_box.append(self.import_button)
+
         reload_button = Gtk.Button(label="Reload")
         reload_button.connect("clicked", lambda *_: self.load_config())
         button_box.append(reload_button)
@@ -1130,6 +1140,127 @@ class AppLockWindow(Gtk.ApplicationWindow):
             "App Lock rules and website blocks synchronized",
             "Unable to synchronize App Lock rules and website blocks",
         )
+
+    def on_export_settings_clicked(self, _button):
+        if self.applying:
+            return
+        chooser = Gtk.FileChooserNative.new(
+            "Export App Lock settings",
+            self,
+            Gtk.FileChooserAction.SAVE,
+            "_Export",
+            "_Cancel",
+        )
+        chooser.set_modal(True)
+        chooser.set_current_name("applock-settings.json")
+
+        json_filter = Gtk.FileFilter()
+        json_filter.set_name("App Lock settings (*.json)")
+        json_filter.add_pattern("*.json")
+        chooser.add_filter(json_filter)
+
+        chooser.connect("response", self.on_export_settings_response)
+        chooser.show()
+
+    def on_export_settings_response(self, chooser, response):
+        if response != Gtk.ResponseType.ACCEPT:
+            chooser.destroy()
+            return
+        file = chooser.get_file()
+        chooser.destroy()
+
+        if file is None:
+            return
+        path = file.get_path()
+        if not path:
+            self.set_status("Choose a file for the settings export", error=True)
+            return
+
+        try:
+            export = {
+                "type": "applock-config",
+                "version": 1,
+                "apps": self.apps,
+                "websites": self.websites,
+            }
+            Path(path).write_text(
+                json.dumps(export, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            self.set_status(f"Unable to export settings: {exc}", error=True)
+            return
+
+        count = len(self.apps) + len(self.websites)
+        self.set_status(f"Exported {count} setting(s) to {path}")
+
+    def on_import_settings_clicked(self, _button):
+        if self.applying:
+            return
+        chooser = Gtk.FileChooserNative.new(
+            "Import App Lock settings",
+            self,
+            Gtk.FileChooserAction.OPEN,
+            "_Import",
+            "_Cancel",
+        )
+        chooser.set_modal(True)
+
+        json_filter = Gtk.FileFilter()
+        json_filter.set_name("App Lock settings (*.json)")
+        json_filter.add_pattern("*.json")
+        chooser.add_filter(json_filter)
+
+        chooser.connect("response", self.on_import_settings_response)
+        chooser.show()
+
+    def on_import_settings_response(self, chooser, response):
+        if response != Gtk.ResponseType.ACCEPT:
+            chooser.destroy()
+            return
+        file = chooser.get_file()
+        chooser.destroy()
+
+        if file is None:
+            return
+        path = file.get_path()
+        if not path:
+            self.set_status("Choose a settings file to import", error=True)
+            return
+
+        try:
+            with Path(path).open("r", encoding="utf-8") as handle:
+                imported = json.load(handle)
+        except Exception as exc:
+            self.set_status(f"Unable to import settings: {exc}", error=True)
+            return
+
+        if not isinstance(imported, dict):
+            self.set_status("Invalid settings file: expected a JSON object", error=True)
+            return
+        if "type" in imported and imported.get("type") != "applock-config":
+            self.set_status("Invalid settings file: unsupported App Lock format", error=True)
+            return
+        if "version" in imported and imported.get("version") != 1:
+            self.set_status("Invalid settings file: unsupported settings version", error=True)
+            return
+
+        apps = imported.get("apps", {})
+        websites = imported.get("websites", {})
+        if not isinstance(apps, dict) or not isinstance(websites, dict):
+            self.set_status("Invalid settings file: apps and websites must be objects", error=True)
+            return
+        if self.applying:
+            return
+
+        self.apps = apps
+        self.websites = websites
+        self.selected_name = None
+        self.selected_website = None
+        self.refresh_combo()
+        self.refresh_website_combo()
+        count = len(apps) + len(websites)
+        self.set_status(f"Imported {count} setting(s). Review, then Apply to save.")
 
     def on_apply_clicked(self, _button):
         if self.applying:

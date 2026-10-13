@@ -25,6 +25,7 @@ Use the GUI to:
 - add or remove apps and websites
 - choose **Always locked/blocked** or a daily window
 - apply configuration and synchronize AppArmor rules and website blocks
+- export and import app/website settings as JSON (excluding the unlock code)
 
 Log out and back in after installing or changing the AppArmor profile. The logout also applies the new `applock` group membership used for the daemon socket.
 
@@ -66,6 +67,7 @@ A block window may cross midnight. For example, `19:00` to `07:00` blocks from 7
 
 - AppArmor denial rules use `mrx`, so locked binaries cannot be read, mapped, or executed directly from GNOME Shell or its child processes.
 - The unlock code is stored as a salted SHA-256 hash in root-only `/etc/applock/code`.
+- Exported settings contain app and website rules but not the unlock code.
 - The daemon only launches paths listed in root-owned `/etc/applock/apps.json`.
 - Website configuration is stored in the same root-owned file and applied by the root daemon.
 - A user with root privileges can still disable the lock; this is a parental-control tool, not a defense against an administrator.
@@ -85,6 +87,7 @@ applock-admin-gui
 The GUI can:
 
 - add locked applications from executable paths or the desktop app menu
+- export the current settings to JSON and import them later
 - add Flatpak applications by application ID or installed Flatpak launcher
 - remove locked applications and blocked websites
 - set the unlock code
