@@ -636,7 +636,7 @@ def import_config(path):
     apply_config(path)
 
 
-def add_app(name, path, args, schedule=None):
+def build_parser():
     parser = argparse.ArgumentParser(description="Configure AppArmor App Lock")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
